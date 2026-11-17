@@ -1,4 +1,5 @@
 import dataclasses
+import functools
 import pathlib
 import typing
 
@@ -52,6 +53,21 @@ GRADES = [
     {"student_id": 1002, "course_id": "SRS", "grade": 15},
     {"student_id": 1001, "course_id": "SSD", "grade": 16},
 ]
+
+def authenticated_user():
+    """Resolve session identity against the server-side user directory."""
+    username = flask.session.get("user")
+    return USERS.get(username) if isinstance(username, str) else None
+
+
+def login_required(view):
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if authenticated_user() is None:
+            return {"error": "authentication required"}, 401
+        return view(*args, **kwargs)
+    return wrapped
+
 
 def find_grade(student_id, course_id):
     for row in GRADES:
@@ -113,25 +129,79 @@ def me():
     }
 
 @app.get("/students/<student_id>/profile")
+@login_required
 def get_profile(student_id):
-    profile = STUDENT_PROFILES.get(int(student_id))
+    user = authenticated_user()
+    try:
+        sid = int(student_id)
+    except (TypeError, ValueError):
+        flask.abort(400)
+
+    # Professors cannot read student profile records.
+    if user.role == "professor" or (
+        user.role == "student" and user.student_id != sid
+    ):
+        flask.abort(403)
+    if user.role not in {"student", "admin"}:
+        flask.abort(403)
+
+    profile = STUDENT_PROFILES.get(sid)
     if profile is None:
         return {"error": "student not found"}, 404
     return flask.jsonify(profile)
 
 @app.get("/grades/<student_id>")
+@login_required
 def get_grades(student_id):
-    sid = int(student_id)
+    user = authenticated_user()
+    try:
+        sid = int(student_id)
+    except (TypeError, ValueError):
+        flask.abort(400)
+
     rows = [row for row in GRADES if row["student_id"] == sid]
+
+    if user.role == "student":
+        rows = rows if user.student_id == sid else []
+    elif user.role == "professor":
+        rows = [
+            row for row in rows
+            if row["course_id"] in (user.courses or [])
+        ]
+    elif user.role != "admin":
+        rows = []
+
+    # Never disclose an empty or unauthorized grade result.
+    if not rows:
+        flask.abort(403)
     return flask.jsonify(rows)
 
 @app.post("/grades/update")
+@login_required
 def update_grade():
-    data = flask.request.get_json()
+    # Authentication runs before request-body parsing.
+    user = authenticated_user()
+    data = flask.request.get_json(silent=True)
+    if not isinstance(data, dict):
+        flask.abort(400)
+    try:
+        student_id = int(data["student_id"])
+        course_id = data["course_id"]
+        grade = data["grade"]
+    except (KeyError, TypeError, ValueError):
+        flask.abort(400)
 
-    student_id = data["student_id"]
-    course_id = data["course_id"]
-    grade = data["grade"]
+    if not isinstance(course_id, str) or not course_id:
+        flask.abort(400)
+
+    if user.role == "professor":
+        if course_id not in (user.courses or []):
+            flask.abort(403)
+    elif user.role != "admin":
+        flask.abort(403)
+
+    if student_id not in STUDENT_PROFILES:
+        flask.abort(404)
 
     row = find_grade(student_id, course_id)
     if row is None:
@@ -142,13 +212,29 @@ def update_grade():
     return {"status": "ok", "student_id": student_id, "course_id": course_id, "grade": grade}
 
 @app.get("/files")
+@login_required
 def download_file():
     raw_path = flask.request.args.get("path", "")
-    target = MATERIALS_DIR / raw_path
+    requested = pathlib.Path(raw_path)
+    if requested.is_absolute():
+        return {"error": "file not found"}, 404
+
+    try:
+        root = MATERIALS_DIR.resolve(strict=True)
+        target = (root / requested).resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return {"error": "file not found"}, 404
+
+    if not target.is_file():
+        return {"error": "file not found"}, 404
     return flask.send_file(target)
 
 @app.errorhandler(Exception)
 def handle_error(exc):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return {"error": exc.description}, exc.code
     return {
         "error": str(exc),
         "type": exc.__class__.__name__,
