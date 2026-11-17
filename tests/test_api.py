@@ -41,6 +41,14 @@ def test_login_with_valid_credentials():
 def test_get_student_profile():
     client = app.test_client()
 
+    unauth_response = client.get("/students/1001/profile")
+    assert unauth_response.status_code == 401
+
+    client.post(
+        "/login",
+        data={"username": "alice", "password": "alicepw"},
+        follow_redirects=True,
+    )
     response = client.get("/students/1001/profile")
 
     assert response.status_code == 200
@@ -52,6 +60,14 @@ def test_get_student_profile():
 def test_get_student_grades():
     client = app.test_client()
 
+    unauth_response = client.get("/grades/1001")
+    assert unauth_response.status_code == 401
+
+    client.post(
+        "/login",
+        data={"username": "alice", "password": "alicepw"},
+        follow_redirects=True,
+    )
     response = client.get("/grades/1001")
 
     assert response.status_code == 200
